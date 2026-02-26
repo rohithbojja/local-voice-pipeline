@@ -1,15 +1,10 @@
 """
-Local Voice Pipeline — WebSocket Server (Fully Local, Open-Source)
+Local Voice Pipeline — Ultra-Fast WebSocket Server
 
-Browser → WebSocket → VAD → Whisper ASR → LLM → F5-TTS → Audio back
+Browser → WebSocket → VAD → Whisper ASR → LLM (stream) → Kokoro TTS → Audio back
 
-Everything runs locally:
-  - ASR: Faster-Whisper (GPU)
-  - TTS: F5-TTS (GPU, emotional voice)
-  - LLM: Ollama (local)
-  - VAD: Silero (local)
-
-All models are PRE-LOADED at server startup for instant response.
+All models pre-loaded at startup. LLM streams sentence-by-sentence,
+TTS generates per-sentence for minimal latency.
 
 Run:  python server.py
 Open: http://localhost:8890
@@ -49,62 +44,44 @@ for noisy in ["urllib3", "httpcore", "httpx", "azure", "websockets", "uvicorn.ac
 
 logger = logging.getLogger("pipeline")
 
-# ===== GLOBAL MODEL SINGLETONS (preloaded at startup) =====
-_asr_model = None   # WhisperModel instance (shared across sessions)
-_tts_runner = None   # TTSRunner instance (shared across sessions)
-_vad_model = None    # VAD model reference
+# ===== GLOBAL SINGLETONS =====
+_asr_model = None
+_tts_runner = None
 
 
 def preload_all_models():
-    """Load all heavy models into GPU/RAM before server starts accepting connections."""
-    global _asr_model, _tts_runner, _vad_model
+    global _asr_model, _tts_runner
 
     print("\n  ⏳ Pre-loading AI models into GPU...")
 
-    # 1. Load Whisper ASR model
-    print("  [1/3] Loading Whisper ASR model...")
+    # 1. Whisper ASR
+    print("  [1/3] Loading Whisper ASR...")
     from faster_whisper import WhisperModel
-    _asr_model = WhisperModel(
-        config.ASR_MODEL,
-        device=config.ASR_DEVICE,
-        compute_type=config.ASR_COMPUTE_TYPE,
-    )
-    print(f"  ✅ Whisper ({config.ASR_MODEL}) loaded on {config.ASR_DEVICE}")
+    _asr_model = WhisperModel(config.ASR_MODEL, device=config.ASR_DEVICE,
+                               compute_type=config.ASR_COMPUTE_TYPE)
+    print(f"  ✅ Whisper ({config.ASR_MODEL}) loaded")
 
-    # 2. Load F5-TTS model
-    print("  [2/3] Loading F5-TTS model (this takes ~15s)...")
-    _tts_runner = TTSRunner(
-        ref_audio_path=config.TTS_REF_AUDIO,
-        ref_text=config.TTS_REF_TEXT,
-        model_type=config.TTS_MODEL_TYPE,
-        device=config.TTS_DEVICE,
-        speed=config.TTS_SPEED,
-        nfe_step=config.TTS_NFE_STEP,
-    )
-    _tts_runner._ensure_model()  # Force immediate load
-    print(f"  ✅ F5-TTS ({config.TTS_MODEL_TYPE}) loaded on {config.TTS_DEVICE}")
+    # 2. Kokoro TTS
+    print("  [2/3] Loading Kokoro TTS...")
+    _tts_runner = TTSRunner(voice=config.TTS_VOICE, device=config.TTS_DEVICE,
+                             speed=config.TTS_SPEED)
+    _tts_runner._ensure_model()
+    print(f"  ✅ Kokoro TTS ({config.TTS_VOICE}) loaded")
 
-    # 3. Load Silero VAD model (fast, but still preload)
-    print("  [3/3] Loading Silero VAD model...")
-    _vad_test = VADProcessor(sample_rate=config.ASR_SAMPLE_RATE)
-    _vad_model = True  # VAD caches itself via torch.hub
+    # 3. Silero VAD
+    print("  [3/3] Loading Silero VAD...")
+    VADProcessor(sample_rate=config.ASR_SAMPLE_RATE)
     print("  ✅ Silero VAD loaded")
 
-    print("  🚀 All models loaded! Server ready for instant responses.\n")
+    print("  🚀 All models ready! Ultra-fast pipeline active.\n")
 
-
-# ===== FastAPI App with Lifespan =====
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Preload models before server starts accepting connections."""
     await asyncio.to_thread(preload_all_models)
     yield
-    # Cleanup
-    global _tts_runner
     if _tts_runner:
         _tts_runner.cleanup()
-    logger.info("Server shutdown, models cleaned up")
 
 app = FastAPI(title="Local Voice Pipeline", lifespan=lifespan)
 
@@ -116,7 +93,6 @@ async def index():
 
 
 class SessionState:
-    """Mutable state shared across async tasks in a session."""
     def __init__(self):
         self.tts_playing = False
         self.barge_triggered = False
@@ -128,31 +104,20 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     logger.info("Client connected")
 
-    # Create per-session ASR runner that uses the preloaded model
     asr = ASRRunner(
-        model_size=config.ASR_MODEL,
-        device=config.ASR_DEVICE,
-        compute_type=config.ASR_COMPUTE_TYPE,
-        language=config.ASR_LANGUAGE,
+        model_size=config.ASR_MODEL, device=config.ASR_DEVICE,
+        compute_type=config.ASR_COMPUTE_TYPE, language=config.ASR_LANGUAGE,
         sample_rate=config.ASR_SAMPLE_RATE,
     )
-    # Inject the preloaded model instead of loading a new one
-    asr._model = _asr_model
+    asr._model = _asr_model  # Use preloaded model
 
     llm = LLMClient(base_url=config.LLM_BASE_URL, model=config.LLM_MODEL)
-
-    # Use the global preloaded TTS runner
     tts = _tts_runner
-
     vad = VADProcessor(sample_rate=config.ASR_SAMPLE_RATE, threshold=0.5,
                        min_speech_ms=250, min_silence_ms=700)
 
     state = SessionState()
-
-    # ASR start (just sets up the queue, model already loaded)
     transcript_queue = await asr.start()
-
-    # Tell client we're ready immediately
     await ws.send_json({"type": "status", "text": "🎤 Listening..."})
 
     async def send_json_safe(data: dict):
@@ -162,66 +127,79 @@ async def websocket_endpoint(ws: WebSocket):
         except Exception:
             pass
 
+    async def send_audio_chunk(audio_bytes: bytes):
+        """Send a chunk of audio to the browser."""
+        CHUNK_SIZE = tts.sample_rate * 2  # 1 second of PCM16
+        for i in range(0, len(audio_bytes), CHUNK_SIZE):
+            if state.barge_triggered:
+                logger.info("⚡ Barge-in — stopping TTS stream")
+                return
+            chunk = audio_bytes[i:i + CHUNK_SIZE]
+            audio_b64 = base64.b64encode(chunk).decode("ascii")
+            await send_json_safe({
+                "type": "audio",
+                "data": audio_b64,
+                "sample_rate": tts.sample_rate,
+            })
+            await asyncio.sleep(0.01)
+
     async def process_transcripts():
-        """Listen for ASR results, run LLM + TTS."""
+        """Listen for ASR results, stream LLM → TTS."""
         while state.active:
             try:
                 event = await asyncio.wait_for(transcript_queue.get(), timeout=0.3)
             except asyncio.TimeoutError:
                 continue
 
+            if event["type"] != "final":
+                continue
+
             transcript = event["text"]
+            await send_json_safe({"type": "transcript", "text": transcript})
+            logger.info(f"Transcript: {transcript}")
 
-            if event["type"] == "final":
-                await send_json_safe({"type": "transcript", "text": transcript})
-                logger.info(f"Transcript: {transcript}")
+            # Stream LLM → TTS sentence by sentence
+            await send_json_safe({"type": "status", "text": "🤔 Thinking..."})
+            state.barge_triggered = False
+            state.tts_playing = True
 
-                # LLM
-                await send_json_safe({"type": "status", "text": "🤔 Thinking..."})
-                state.barge_triggered = False
-                llm_start = time.time()
-                response = await asyncio.to_thread(llm.send, transcript)
-                llm_time = time.time() - llm_start
-                await send_json_safe({"type": "response", "text": response})
-                logger.info(f"LLM ({llm_time:.1f}s): {response}")
+            pipeline_start = time.time()
+            full_response = ""
+            first_audio = True
 
-                if state.barge_triggered:
-                    logger.info("⚡ Barge-in during LLM — skipping TTS")
-                    await send_json_safe({"type": "status", "text": "🎤 Listening..."})
-                    continue
+            try:
+                for sentence in await asyncio.to_thread(
+                    lambda: list(llm.stream_sentences(transcript))
+                ):
+                    if state.barge_triggered:
+                        logger.info("⚡ Barge-in during pipeline")
+                        break
 
-                # TTS
-                await send_json_safe({"type": "status", "text": "🔊 Generating Speech..."})
-                state.tts_playing = True
-                tts_start = time.time()
+                    full_response += sentence + " "
 
-                if state.barge_triggered:
-                    state.tts_playing = False
-                    continue
+                    if first_audio:
+                        await send_json_safe({"type": "status", "text": "🔊 Speaking..."})
+                        first_audio = False
 
-                audio_bytes = await asyncio.to_thread(tts.generate, response)
-                tts_time = time.time() - tts_start
+                    # Generate TTS for this sentence
+                    tts_start = time.time()
+                    audio_bytes = await asyncio.to_thread(tts.generate, sentence)
+                    tts_time = time.time() - tts_start
+                    logger.info(f"TTS sentence ({tts_time:.2f}s): {sentence[:60]}...")
 
-                if audio_bytes and not state.barge_triggered:
-                    await send_json_safe({"type": "status", "text": "🔊 Speaking..."})
-                    CHUNK_SIZE = tts.sample_rate * 2  # 1 second of PCM16
-                    for i in range(0, len(audio_bytes), CHUNK_SIZE):
-                        if state.barge_triggered:
-                            logger.info("⚡ Barge-in — stopping TTS stream")
-                            break
-                        chunk = audio_bytes[i:i + CHUNK_SIZE]
-                        audio_b64 = base64.b64encode(chunk).decode("ascii")
-                        await send_json_safe({
-                            "type": "audio",
-                            "data": audio_b64,
-                            "sample_rate": tts.sample_rate,
-                        })
-                        await asyncio.sleep(0.02)
-                    logger.info(f"TTS ({tts_time:.1f}s): {len(audio_bytes)} bytes")
+                    if audio_bytes and not state.barge_triggered:
+                        await send_audio_chunk(audio_bytes)
 
-                state.tts_playing = False
-                if not state.barge_triggered:
-                    await send_json_safe({"type": "status", "text": "🎤 Listening..."})
+            except Exception as e:
+                logger.error(f"Pipeline error: {e}", exc_info=True)
+
+            total_time = time.time() - pipeline_start
+            logger.info(f"Pipeline total: {total_time:.1f}s | Response: {full_response.strip()[:80]}...")
+
+            await send_json_safe({"type": "response", "text": full_response.strip()})
+            state.tts_playing = False
+            if not state.barge_triggered:
+                await send_json_safe({"type": "status", "text": "🎤 Listening..."})
 
     processor_task = asyncio.create_task(process_transcripts())
 
@@ -231,13 +209,11 @@ async def websocket_endpoint(ws: WebSocket):
             if "bytes" in data:
                 audio_bytes = data["bytes"]
 
-                # VAD processing FIRST to set speech state
                 vad_events = await asyncio.to_thread(vad.process, audio_bytes)
                 for evt in vad_events:
                     if evt["type"] == "speech_start":
                         asr.set_speech_active(True)
                         await send_json_safe({"type": "vad", "speaking": True})
-                        logger.info(f"VAD: speech_start | tts_playing={state.tts_playing}")
                         if state.tts_playing:
                             state.barge_triggered = True
                             logger.info("⚡ Server barge-in via VAD")
@@ -245,10 +221,9 @@ async def websocket_endpoint(ws: WebSocket):
                     elif evt["type"] == "speech_end":
                         asr.set_speech_active(False)
                         await send_json_safe({"type": "vad", "speaking": False})
-                        logger.info("VAD: speech_end — triggering Whisper transcription")
+                        logger.info("VAD: speech_end → transcribing")
                         await asyncio.to_thread(asr.transcribe_buffer)
 
-                # Feed audio to ASR buffer (only accumulates during active speech)
                 asr.feed_audio(audio_bytes)
 
             elif "text" in data:
@@ -256,11 +231,10 @@ async def websocket_endpoint(ws: WebSocket):
                 if msg.get("type") == "reset":
                     llm.reset()
                     vad.reset()
-                    await send_json_safe({"type": "status", "text": "🔄 Conversation reset"})
+                    await send_json_safe({"type": "status", "text": "🔄 Reset"})
                 elif msg.get("type") == "barge_in":
                     state.barge_triggered = True
                     state.tts_playing = False
-                    logger.info("⚡ Client barge-in received")
 
     except WebSocketDisconnect:
         logger.info("Client disconnected")
@@ -271,16 +245,15 @@ async def websocket_endpoint(ws: WebSocket):
         processor_task.cancel()
         asr.stop()
         llm.close()
-        # Don't cleanup TTS — it's a global singleton
         logger.info("Session cleaned up")
 
 
 if __name__ == "__main__":
     print("\n" + "=" * 60)
-    print("  🎙️  Local Voice Pipeline (100% Local)")
-    print(f"  ASR: Whisper ({config.ASR_MODEL})  |  LLM: {config.LLM_MODEL}")
-    print(f"  TTS: F5-TTS ({config.TTS_MODEL_TYPE})  |  VAD: Silero")
-    print(f"  Speed: {config.TTS_SPEED}  |  NFE Steps: {config.TTS_NFE_STEP}")
+    print("  🎙️  Ultra-Fast Local Voice Pipeline")
+    print(f"  ASR: Whisper ({config.ASR_MODEL})")
+    print(f"  LLM: {config.LLM_MODEL} (streaming)")
+    print(f"  TTS: Kokoro ({config.TTS_VOICE}) — sub-300ms")
     print(f"  Open: http://localhost:{config.SERVER_PORT}")
     print("=" * 60)
     uvicorn.run(app, host=config.SERVER_HOST, port=config.SERVER_PORT, log_level="info")

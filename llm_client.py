@@ -1,9 +1,10 @@
 """
-LLM Client — OpenAI-compatible API client for local LLM (LM Studio / Ollama / etc).
-Hits http://127.0.0.1:1234/v1/chat/completions with the qwen model.
+LLM Client — Ollama-compatible chat client with streaming support.
+Streams responses sentence-by-sentence for ultra-fast TTS pipelining.
 """
 import logging
 import httpx
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -19,9 +20,9 @@ SYSTEM_PROMPT = (
 
 
 class LLMClient:
-    """OpenAI-compatible chat client for a local LLM server."""
+    """Ollama chat client with both blocking and streaming modes."""
 
-    def __init__(self, base_url: str = "http://127.0.0.1:1234", model: str = "qwen/qwen3.5-35b-a3b"):
+    def __init__(self, base_url: str = "http://127.0.0.1:11434", model: str = "gemma3:4b"):
         self.base_url = base_url.rstrip("/")
         self.model = model
         self.history: list[dict] = [{"role": "system", "content": SYSTEM_PROMPT}]
@@ -29,11 +30,9 @@ class LLMClient:
         logger.info(f"LLM initialized (url={self.base_url}, model={self.model})")
 
     def send(self, text: str) -> str:
-        """Send user text to the LLM and return the response."""
+        """Send user text and return full response (blocking)."""
         try:
-            logger.info(f"LLM input: {text}")
             self.history.append({"role": "user", "content": text})
-
             resp = self._client.post(
                 f"{self.base_url}/v1/chat/completions",
                 json={
@@ -44,18 +43,65 @@ class LLMClient:
                 },
             )
             resp.raise_for_status()
-            data = resp.json()
-            reply = data["choices"][0]["message"]["content"].strip()
-
+            reply = resp.json()["choices"][0]["message"]["content"].strip()
             self.history.append({"role": "assistant", "content": reply})
-            logger.info(f"LLM output: {reply}")
             return reply
         except Exception as e:
             logger.error(f"LLM error: {e}")
-            return "Sorry, I couldn't process that. Please try again."
+            return "Sorry, I could not process that."
+
+    def stream_sentences(self, text: str):
+        """Stream LLM response, yielding complete sentences as they form."""
+        try:
+            self.history.append({"role": "user", "content": text})
+            buffer = ""
+            full_response = ""
+
+            with self._client.stream(
+                "POST",
+                f"{self.base_url}/v1/chat/completions",
+                json={
+                    "model": self.model,
+                    "messages": self.history,
+                    "max_tokens": 256,
+                    "temperature": 0.7,
+                    "stream": True,
+                },
+            ) as resp:
+                for line in resp.iter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data = line[6:]
+                    if data == "[DONE]":
+                        break
+                    try:
+                        import json
+                        chunk = json.loads(data)
+                        delta = chunk["choices"][0].get("delta", {})
+                        token = delta.get("content", "")
+                        if token:
+                            buffer += token
+                            full_response += token
+
+                            # Yield when we hit sentence-ending punctuation
+                            sentences = re.split(r'(?<=[.!?])\s+', buffer, maxsplit=1)
+                            if len(sentences) > 1:
+                                yield sentences[0]
+                                buffer = sentences[1]
+                    except Exception:
+                        continue
+
+            # Yield remaining buffer
+            if buffer.strip():
+                yield buffer.strip()
+
+            self.history.append({"role": "assistant", "content": full_response})
+
+        except Exception as e:
+            logger.error(f"LLM stream error: {e}")
+            yield "Sorry, I could not process that."
 
     def reset(self):
-        """Reset conversation history."""
         self.history = [{"role": "system", "content": SYSTEM_PROMPT}]
         logger.info("LLM conversation reset")
 
