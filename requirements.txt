@@ -1,17 +1,21 @@
-# Audio I/O
-sounddevice
-numpy
+# ASR (Faster-Whisper — local GPU)
+faster-whisper
 
-# ASR (Microsoft Azure Speech SDK)
-azure-cognitiveservices-speech
+# TTS (F5-TTS — local GPU, emotional)
+f5-tts
 
-# TTS (ElevenLabs)
-elevenlabs
-
-# LLM (local OpenAI-compatible API)
+# LLM (local OpenAI-compatible API — Ollama)
 httpx
 
 # VAD (Silero Voice Activity Detection)
+# Included via torch
+
+# Audio
+sounddevice
+numpy
+soundfile
+
+# Deep learning
 torch
 torchaudio
 
