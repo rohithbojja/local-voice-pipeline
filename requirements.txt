@@ -1,0 +1,21 @@
+# Audio I/O
+sounddevice
+numpy
+
+# ASR (Microsoft Azure Speech SDK)
+azure-cognitiveservices-speech
+
+# TTS (ElevenLabs)
+elevenlabs
+
+# LLM (local OpenAI-compatible API)
+httpx
+
+# VAD (Silero Voice Activity Detection)
+torch
+torchaudio
+
+# WebSocket server
+fastapi
+uvicorn[standard]
+websockets
