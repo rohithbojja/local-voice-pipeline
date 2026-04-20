@@ -1,25 +1,26 @@
-# ASR (Faster-Whisper — local GPU)
-faster-whisper
+python-dotenv
 
-# TTS (F5-TTS — local GPU, emotional)
-f5-tts
+# ASR — Parakeet TDT MLX (Apple Silicon): https://huggingface.co/animaslabs/parakeet-tdt-0.6b-v3-mlx-4bit
+parakeet-mlx
+
+# TTS — OmniVoice (https://huggingface.co/k2-fsa/OmniVoice)
+omnivoice
 
 # LLM (local OpenAI-compatible API — Ollama)
 httpx
 
-# VAD (Silero Voice Activity Detection)
-# Included via torch
+# VAD (Silero) is loaded via torch.hub
 
 # Audio
 sounddevice
 numpy
 soundfile
 
-# Deep learning
+# Deep learning (torch stack aligned with omnivoice; pin if needed for your platform)
 torch
 torchaudio
 
-# WebSocket server
+# Web server
 fastapi
 uvicorn[standard]
 websockets

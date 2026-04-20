@@ -1,0 +1,20 @@
+[project]
+name = "local-voice-pipeline"
+version = "0.1.0"
+description = "Local ASR → LLM → OmniVoice TTS voice pipeline"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "python-dotenv",
+    "parakeet-mlx",
+    "omnivoice",
+    "httpx",
+    "sounddevice",
+    "numpy",
+    "soundfile",
+    "torch",
+    "torchaudio",
+    "fastapi",
+    "uvicorn[standard]",
+    "websockets",
+]

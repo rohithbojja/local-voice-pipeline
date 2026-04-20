@@ -4,24 +4,22 @@ Ultra-Fast Local Voice Pipeline that enables end-to-end true voice communication
 It supports both a Browser WebSocket-based UI and a Terminal-Only Mode.
 
 ## Features
-- **ASR (Speech-to-Text):** Faster-Whisper (local GPU) for ultra-fast, accurate transcription.
+- **ASR (Speech-to-Text):** [Parakeet TDT MLX](https://huggingface.co/animaslabs/parakeet-tdt-0.6b-v3-mlx-4bit) (Apple Silicon / MLX, 4-bit quantized).
 - **VAD (Voice Activity Detection):** Silero VAD for highly responsive speech detection.
 - **LLM (Language Model):** Local OpenAI-compatible API (Ollama/llama.cpp) with GGUF models. It streams responses sentence-by-sentence.
-- **TTS (Text-to-Speech):** Supports multiple engines:
-  - Kokoro TTS
-  - F5-TTS
-  - Fish-Speech
+- **TTS (Text-to-Speech):** [OmniVoice](https://huggingface.co/k2-fsa/OmniVoice) (local, multilingual; always clones from your reference clip).
 - **Barge-In Support:** Interrupt the AI while it's speaking by simply talking over it.
 - **Interfaces:**
   - `server.py`: FastAPI + WebSocket server for browser-based UI.
   - `terminal_app.py`: Rich-based terminal UI for mic/speaker integration directly in the console.
 
 ## Setup
-Ensure you have the required dependencies:
+Create a virtual environment and install dependencies (recommended: [uv](https://github.com/astral-sh/uv)):
 ```bash
-pip install -r requirements.txt
+uv venv && source .venv/bin/activate
+uv sync
 ```
-Set up the `.env` file with any API keys or configuration options following the defined config settings in `config.py`.
+Copy **`.env.example`** to **`.env`** and adjust (Ollama model name, etc.). **ASR** requires **Apple Silicon** and **`parakeet-mlx`**; override **`ASR_MODEL`** if you use another Parakeet MLX checkpoint on the Hub. **ffmpeg** must be on `PATH` (used by Parakeet to decode audio). TTS clones from **`reference.wav`** + **`reference.txt`** next to `config.py` unless overridden.
 
 ## Usage
 
@@ -42,8 +40,8 @@ You can speak into your microphone and the AI will respond through your speakers
 ## Architecture
 1. Microphone captures audio.
 2. Silero VAD detects voice activity.
-3. Audio is sent to Faster-Whisper for transcription.
+3. Audio is transcribed with Parakeet TDT (MLX).
 4. Transcript is sent to the local LLM.
 5. The LLM streams sentences back.
-6. Each sentence is synthesized into audio chunks using Kokoro/F5-TTS/Fish-Speech.
+6. Each sentence is synthesized with OmniVoice and streamed as PCM audio.
 7. Audio chunks are played gaplessly (either via browser Web Audio API or sounddevice in terminal).

@@ -1,92 +1,134 @@
 """
-TTS Runner — Kokoro TTS (ultra-fast local GPU inference).
-82M params, sub-300ms latency, 24kHz output.
+TTS — OmniVoice (k2-fsa/OmniVoice): always uses a fixed reference clip for zero-shot cloning.
+https://huggingface.co/k2-fsa/OmniVoice
 """
+from __future__ import annotations
+
 import logging
+import re
+from pathlib import Path
+from typing import Any, Optional
+
 import numpy as np
 import torch
-import asyncio
-import re
 
 logger = logging.getLogger(__name__)
 
 
-class TTSRunner:
-    """
-    Kokoro TTS — blazingly fast local TTS.
-    82M params, ~200ms inference on GPU, 24kHz output.
-    """
+def _device_map_and_dtype(device_pref: str) -> tuple[str, torch.dtype]:
+    """Pick Hugging Face device_map and dtype from a coarse preference (cuda / mps / cpu)."""
+    p = (device_pref or "cuda").lower().strip()
+    if p.startswith("cuda"):
+        if torch.cuda.is_available():
+            return ("cuda:0" if p in ("cuda", "cuda:0") else p), torch.float16
+        logger.warning("CUDA requested but not available; using CPU.")
+    if p.startswith("mps"):
+        if torch.backends.mps.is_available():
+            return ("mps:0" if p == "mps" else p), torch.float16
+        logger.warning("MPS requested but not available; using CPU.")
+    return "cpu", torch.float32
 
-    def __init__(self, voice: str = "af_heart", device: str = None, speed: float = 1.0):
-        self.voice = voice
+
+class TTSRunner:
+    """OmniVoice inference with a single cached voice-clone prompt (reference WAV + transcript)."""
+
+    def __init__(
+        self,
+        model_id: str,
+        ref_audio: str,
+        ref_text: str,
+        device_pref: str,
+        language: Optional[str],
+        speed: Optional[float],
+        generation_kwargs: Optional[dict[str, Any]] = None,
+    ):
+        self.model_id = model_id
+        self.ref_audio = ref_audio
+        self.ref_text = ref_text
+        self.device_pref = device_pref
+        self.language = language
         self.speed = speed
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self._pipeline = None
+        self.generation_kwargs = generation_kwargs or {}
+        self._model = None
+        self._clone_prompt = None
         self.sample_rate = 24000
 
-    def _ensure_model(self):
-        if self._pipeline is None:
-            logger.info(f"Loading Kokoro TTS (voice={self.voice}) on {self.device}...")
-            from kokoro import KPipeline
-            self._pipeline = KPipeline(lang_code='a', device=self.device)
-            logger.info("Kokoro TTS loaded")
+    def _ensure_model(self) -> None:
+        if self._model is not None:
+            return
 
-    async def start(self):
-        """Preload the model."""
-        await asyncio.to_thread(self._ensure_model)
+        from omnivoice import OmniVoice
+
+        device_map, torch_dtype = _device_map_and_dtype(self.device_pref)
+        logger.info("Loading OmniVoice %s on %s (%s)...", self.model_id, device_map, torch_dtype)
+
+        self._model = OmniVoice.from_pretrained(
+            self.model_id,
+            torch_dtype=torch_dtype,
+            device_map=device_map,
+        )
+        sr = getattr(self._model, "sampling_rate", None)
+        if sr:
+            self.sample_rate = int(sr)
+
+        path = Path(self.ref_audio).expanduser()
+        if not path.is_file():
+            raise FileNotFoundError(
+                f"Reference audio not found: {path.resolve()}. "
+                "Add reference.wav beside config.py or set OMNIVOICE_REF_AUDIO."
+            )
+        transcript = (self.ref_text or "").strip()
+        if not transcript:
+            raise ValueError(
+                "Reference transcript is empty. Set OMNIVOICE_REF_TEXT or add reference.txt "
+                "(exact words spoken in the reference WAV) beside config.py."
+            )
+        self._clone_prompt = self._model.create_voice_clone_prompt(
+            str(path.resolve()),
+            transcript,
+        )
+        logger.info("OmniVoice voice-clone prompt built from %s", path)
+
+        logger.info("OmniVoice loaded (sample_rate=%s)", self.sample_rate)
 
     def generate(self, text: str) -> bytes:
-        """Generate PCM16 audio bytes from text. Ultra-fast."""
-        self._ensure_model()
-        try:
-            text = self._clean_text(text)
-            logger.info(f"TTS generating: {text[:80]}...")
-
-            # Kokoro generates audio segments
-            audio_segments = []
-            for result in self._pipeline(text, voice=self.voice, speed=self.speed):
-                if result.audio is not None:
-                    audio_segments.append(result.audio.numpy())
-
-            if not audio_segments:
-                logger.warning("TTS produced no audio")
-                return b""
-
-            # Concatenate all segments
-            wav = np.concatenate(audio_segments)
-
-            # Normalize
-            max_val = np.max(np.abs(wav))
-            if max_val > 0:
-                wav = wav / max_val * 0.95
-
-            pcm16 = (wav * 32767).astype(np.int16)
-            audio_bytes = pcm16.tobytes()
-            duration = len(pcm16) / self.sample_rate
-            logger.info(f"TTS generated {len(audio_bytes)} bytes ({duration:.1f}s)")
-            return audio_bytes
-
-        except Exception as e:
-            logger.error(f"TTS error: {e}", exc_info=True)
-            return b""
-
-    def generate_streaming(self, text: str):
-        """Generate audio chunks as a generator — for sentence-level streaming."""
+        """PCM16 mono bytes at ``self.sample_rate``."""
         self._ensure_model()
         text = self._clean_text(text)
+        if not text:
+            return b""
 
-        for result in self._pipeline(text, voice=self.voice, speed=self.speed):
-            if result.audio is not None:
-                wav = result.audio.numpy()
-                max_val = np.max(np.abs(wav))
-                if max_val > 0:
-                    wav = wav / max_val * 0.95
-                pcm16 = (wav * 32767).astype(np.int16)
-                yield pcm16.tobytes()
+        try:
+            kwargs = dict(self.generation_kwargs)
+            kwargs["voice_clone_prompt"] = self._clone_prompt
+            if self.language:
+                kwargs["language"] = self.language
+            if self.speed is not None:
+                kwargs["speed"] = self.speed
+
+            audios = self._model.generate(text=text, **kwargs)
+            if not audios:
+                logger.warning("OmniVoice produced no audio")
+                return b""
+
+            wav = np.concatenate([np.asarray(a, dtype=np.float32) for a in audios])
+            peak = float(np.max(np.abs(wav))) if wav.size else 0.0
+            if peak > 0:
+                wav = wav / peak * 0.95
+
+            pcm16 = (wav * 32767.0).astype(np.int16)
+            audio_bytes = pcm16.tobytes()
+            logger.info(
+                "OmniVoice generated %d bytes (%.2fs)",
+                len(audio_bytes),
+                len(pcm16) / self.sample_rate,
+            )
+            return audio_bytes
+        except Exception as e:
+            logger.error("OmniVoice error: %s", e, exc_info=True)
+            return b""
 
     def _clean_text(self, text: str) -> str:
-        """Strip emojis, markdown, and other TTS-unfriendly chars."""
-        # Remove emojis
         emoji_pattern = re.compile(
             "["
             "\U0001F600-\U0001F64F\U0001F300-\U0001F5FF"
@@ -94,19 +136,21 @@ class TTSRunner:
             "\U00002702-\U000027B0\U000024C2-\U0001F251"
             "\U00010000-\U0010ffff\u200d\ufe0f"
             "\u2600-\u26FF\u2700-\u27BF"
-            "]+", flags=re.UNICODE
+            "]+",
+            flags=re.UNICODE,
         )
         text = emoji_pattern.sub("", text)
-        text = re.sub(r'\*+', '', text)
-        text = re.sub(r'_+', ' ', text)
-        text = re.sub(r'#+\s*', '', text)
-        text = re.sub(r'\([^)]*\)', '', text)
-        text = re.sub(r'\s+', ' ', text).strip()
+        text = re.sub(r"\*+", "", text)
+        text = re.sub(r"_+", " ", text)
+        text = re.sub(r"#+\s*", "", text)
+        text = re.sub(r"\([^)]*\)", "", text)
+        text = re.sub(r"\s+", " ", text).strip()
         return text
 
-    def cleanup(self):
-        if self._pipeline is not None:
-            del self._pipeline
-            self._pipeline = None
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+    def cleanup(self) -> None:
+        self._clone_prompt = None
+        if self._model is not None:
+            del self._model
+            self._model = None
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
