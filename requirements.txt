@@ -1,7 +1,7 @@
 python-dotenv
 
-# ASR — Parakeet TDT MLX (Apple Silicon): https://huggingface.co/animaslabs/parakeet-tdt-0.6b-v3-mlx-4bit
-parakeet-mlx
+# ASR (Faster-Whisper — local)
+faster-whisper
 
 # TTS — OmniVoice (https://huggingface.co/k2-fsa/OmniVoice)
 omnivoice
@@ -9,14 +9,12 @@ omnivoice
 # LLM (local OpenAI-compatible API — Ollama)
 httpx
 
-# VAD (Silero) is loaded via torch.hub
-
 # Audio
 sounddevice
 numpy
 soundfile
 
-# Deep learning (torch stack aligned with omnivoice; pin if needed for your platform)
+# Deep learning
 torch
 torchaudio
 

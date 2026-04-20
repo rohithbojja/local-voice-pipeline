@@ -4,7 +4,7 @@ Ultra-Fast Local Voice Pipeline that enables end-to-end true voice communication
 It supports both a Browser WebSocket-based UI and a Terminal-Only Mode.
 
 ## Features
-- **ASR (Speech-to-Text):** [Parakeet TDT MLX](https://huggingface.co/animaslabs/parakeet-tdt-0.6b-v3-mlx-4bit) (Apple Silicon / MLX, 4-bit quantized).
+- **ASR (Speech-to-Text):** Faster-Whisper (local CTranslate2; CUDA or CPU).
 - **VAD (Voice Activity Detection):** Silero VAD for highly responsive speech detection.
 - **LLM (Language Model):** Local OpenAI-compatible API (Ollama/llama.cpp) with GGUF models. It streams responses sentence-by-sentence.
 - **TTS (Text-to-Speech):** [OmniVoice](https://huggingface.co/k2-fsa/OmniVoice) (local, multilingual; always clones from your reference clip).
@@ -19,7 +19,7 @@ Create a virtual environment and install dependencies (recommended: [uv](https:/
 uv venv && source .venv/bin/activate
 uv sync
 ```
-Copy **`.env.example`** to **`.env`** and adjust (Ollama model name, etc.). **ASR** requires **Apple Silicon** and **`parakeet-mlx`**; override **`ASR_MODEL`** if you use another Parakeet MLX checkpoint on the Hub. **ffmpeg** must be on `PATH` (used by Parakeet to decode audio). TTS clones from **`reference.wav`** + **`reference.txt`** next to `config.py` unless overridden.
+Copy **`.env.example`** to **`.env`** and adjust. Set **`ASR_DEVICE`**, **`ASR_COMPUTE_TYPE`**, and optional **`ASR_CPU_THREADS`** for your hardware (e.g. CPU + `int8` on Mac). TTS clones from **`reference.wav`** + **`reference.txt`** next to `config.py` unless overridden.
 
 ## Usage
 
@@ -40,7 +40,7 @@ You can speak into your microphone and the AI will respond through your speakers
 ## Architecture
 1. Microphone captures audio.
 2. Silero VAD detects voice activity.
-3. Audio is transcribed with Parakeet TDT (MLX).
+3. Audio is transcribed with Faster-Whisper.
 4. Transcript is sent to the local LLM.
 5. The LLM streams sentences back.
 6. Each sentence is synthesized with OmniVoice and streamed as PCM audio.

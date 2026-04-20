@@ -27,31 +27,26 @@ def _resolve_omnivoice_reference() -> tuple[str, str]:
     return audio, text
 
 
-# ----- ASR (Parakeet TDT — MLX on Apple Silicon only; HF model id) -----
-# Default: https://huggingface.co/animaslabs/parakeet-tdt-0.6b-v3-mlx-4bit
-ASR_MODEL = os.environ.get(
-    "ASR_MODEL", "animaslabs/parakeet-tdt-0.6b-v3-mlx-4bit"
-)
+# ----- ASR (Faster-Whisper — local) -----
+ASR_MODEL = os.environ.get("ASR_MODEL", "large-v3-turbo")
+ASR_DEVICE = os.environ.get("ASR_DEVICE", "cuda")
+ASR_COMPUTE_TYPE = os.environ.get("ASR_COMPUTE_TYPE", "float16")
+ASR_LANGUAGE = os.environ.get("ASR_LANGUAGE", "en")
 ASR_SAMPLE_RATE = int(os.environ.get("ASR_SAMPLE_RATE", "16000"))
+ASR_CPU_THREADS = int(os.environ.get("ASR_CPU_THREADS", "0"))
 
 # ----- TTS (OmniVoice — https://huggingface.co/k2-fsa/OmniVoice) -----
 OMNIVOICE_MODEL = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
-# Always voice-clone: default ``reference.wav`` + ``reference.txt`` beside this file, or env.
 OMNIVOICE_REF_AUDIO, OMNIVOICE_REF_TEXT = _resolve_omnivoice_reference()
-# cuda | mps | cpu (mapped to cuda:0 / mps:0 / cpu inside the runner)
 TTS_DEVICE = os.environ.get("TTS_DEVICE", "cuda")
-# Language hint for better quality (e.g. "en", "English"); empty = model default / agnostic
 OMNIVOICE_LANGUAGE = os.environ.get("OMNIVOICE_LANGUAGE", "en").strip() or None
 _omni_speed = os.environ.get("OMNIVOICE_SPEED", "").strip()
 OMNIVOICE_SPEED: float | None = float(_omni_speed) if _omni_speed else None
-TTS_SAMPLE_RATE = 24000  # OmniVoice is typically 24 kHz; runner updates from the model after load
+TTS_SAMPLE_RATE = 24000
 
 # ----- LLM (Local — Ollama) -----
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:11434")
-LLM_MODEL = os.environ.get("LLM_MODEL", "gemma4-obliterated:latest")
-# OpenAI-compatible: "none" turns off Gemma 4 style thinking on supported Ollama builds.
-# Set empty to omit the field (older Ollama).
-LLM_REASONING_EFFORT = os.environ.get("LLM_REASONING_EFFORT", "none").strip() or None
+LLM_MODEL = os.environ.get("LLM_MODEL", "llama3.2:1b")
 
 # ----- Server -----
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")

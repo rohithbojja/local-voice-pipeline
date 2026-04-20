@@ -1,7 +1,7 @@
 """
 Local Voice Pipeline — Ultra-Fast WebSocket Server
 
-Browser → WebSocket → VAD → Parakeet MLX ASR → LLM (stream) → OmniVoice TTS → Audio back
+Browser → WebSocket → VAD → Whisper ASR → LLM (stream) → OmniVoice TTS → Audio back
 
 All models pre-loaded at startup. LLM streams sentence-by-sentence,
 TTS generates per-sentence for minimal latency.
@@ -38,7 +38,8 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-5s | %(name)s | %(message)s",
     datefmt="%H:%M:%S",
 )
-for noisy in ["urllib3", "httpcore", "httpx", "azure", "websockets", "uvicorn.access"]:
+for noisy in ["urllib3", "httpcore", "httpx", "azure", "websockets", "uvicorn.access",
+              "faster_whisper", "ctranslate2"]:
     logging.getLogger(noisy).setLevel(logging.WARNING)
 
 logger = logging.getLogger("pipeline")
@@ -53,12 +54,18 @@ def preload_all_models():
 
     print("\n  ⏳ Pre-loading AI models...")
 
-    # 1. Parakeet TDT (MLX) ASR — Apple Silicon
-    print("  [1/3] Loading Parakeet MLX ASR...")
-    from asr_runner import load_parakeet_mlx
+    # 1. Whisper ASR
+    print("  [1/3] Loading Whisper ASR...")
+    from faster_whisper import WhisperModel
 
-    _asr_model = load_parakeet_mlx(config.ASR_MODEL)
-    print(f"  ✅ Parakeet MLX ({config.ASR_MODEL}) loaded")
+    _asr_kw: dict = {
+        "device": config.ASR_DEVICE,
+        "compute_type": config.ASR_COMPUTE_TYPE,
+    }
+    if config.ASR_DEVICE == "cpu" and config.ASR_CPU_THREADS > 0:
+        _asr_kw["cpu_threads"] = config.ASR_CPU_THREADS
+    _asr_model = WhisperModel(config.ASR_MODEL, **_asr_kw)
+    print(f"  ✅ Whisper ({config.ASR_MODEL}) loaded")
 
     # 2. OmniVoice TTS
     print("  [2/3] Loading OmniVoice TTS...")
@@ -109,14 +116,17 @@ async def websocket_endpoint(ws: WebSocket):
     await ws.accept()
     logger.info("Client connected")
 
-    asr = ASRRunner(model_id=config.ASR_MODEL, sample_rate=config.ASR_SAMPLE_RATE)
+    asr = ASRRunner(
+        model_size=config.ASR_MODEL,
+        device=config.ASR_DEVICE,
+        compute_type=config.ASR_COMPUTE_TYPE,
+        language=config.ASR_LANGUAGE,
+        sample_rate=config.ASR_SAMPLE_RATE,
+        cpu_threads=config.ASR_CPU_THREADS,
+    )
     asr._model = _asr_model  # Use preloaded model
 
-    llm = LLMClient(
-        base_url=config.LLM_BASE_URL,
-        model=config.LLM_MODEL,
-        reasoning_effort=config.LLM_REASONING_EFFORT,
-    )
+    llm = LLMClient(base_url=config.LLM_BASE_URL, model=config.LLM_MODEL)
     tts = _tts_runner
     vad = VADProcessor(sample_rate=config.ASR_SAMPLE_RATE, threshold=0.5,
                        min_speech_ms=250, min_silence_ms=700)
@@ -173,8 +183,6 @@ async def websocket_endpoint(ws: WebSocket):
             first_audio = True
 
             try:
-                # Materializes full LLM stream first, then TTS runs per sentence (see logs in llm_client).
-                logger.info("Waiting for LLM stream (no TTS until all sentences are collected)...")
                 for sentence in await asyncio.to_thread(
                     lambda: list(llm.stream_sentences(transcript))
                 ):
@@ -258,7 +266,7 @@ async def websocket_endpoint(ws: WebSocket):
 if __name__ == "__main__":
     print("\n" + "=" * 60)
     print("  🎙️  Ultra-Fast Local Voice Pipeline")
-    print(f"  ASR: Parakeet MLX ({config.ASR_MODEL})")
+    print(f"  ASR: Whisper ({config.ASR_MODEL})")
     print(f"  LLM: {config.LLM_MODEL} (streaming)")
     print(f"  TTS: OmniVoice ({config.OMNIVOICE_MODEL})")
     print(f"  Open: http://localhost:{config.SERVER_PORT}")
