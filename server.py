@@ -15,6 +15,7 @@ import base64
 import json
 import time
 import os
+import queue as _queue
 import uvicorn
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse
@@ -183,16 +184,42 @@ async def websocket_endpoint(ws: WebSocket):
             first_audio = True
 
             try:
-                for sentence in await asyncio.to_thread(
-                    lambda: list(llm.stream_sentences(transcript))
-                ):
+                # Use a thread-safe queue so the LLM thread can push
+                # sentences one at a time while we consume them async
+                sentence_q: _queue.Queue = _queue.Queue()
+                SENTINEL = None  # marks end of stream
+
+                def _run_llm():
+                    try:
+                        for s in llm.stream_sentences(transcript):
+                            sentence_q.put(s)
+                    except Exception as exc:
+                        logger.error(f"LLM thread error: {exc}", exc_info=True)
+                    finally:
+                        sentence_q.put(SENTINEL)
+
+                llm_task = asyncio.get_event_loop().run_in_executor(None, _run_llm)
+
+                while True:
                     if state.barge_triggered:
                         logger.info("⚡ Barge-in during pipeline")
                         break
+                    try:
+                        sentence = await asyncio.to_thread(
+                            sentence_q.get, timeout=0.3
+                        )
+                    except Exception:
+                        # queue.get timed out, loop and re-check barge
+                        continue
+
+                    if sentence is SENTINEL:
+                        break  # LLM finished
 
                     full_response += sentence + " "
 
                     if first_audio:
+                        elapsed = time.time() - pipeline_start
+                        logger.info(f"LLM first sentence in {elapsed:.2f}s")
                         await send_json_safe({"type": "status", "text": "🔊 Speaking..."})
                         first_audio = False
 
@@ -200,19 +227,30 @@ async def websocket_endpoint(ws: WebSocket):
                     tts_start = time.time()
                     audio_bytes = await asyncio.to_thread(tts.generate, sentence)
                     tts_time = time.time() - tts_start
-                    logger.info(f"TTS sentence ({tts_time:.2f}s): {sentence[:60]}...")
+                    logger.info(f"TTS sentence ({tts_time:.2f}s): {sentence[:60]}")
 
                     if audio_bytes and not state.barge_triggered:
                         await send_audio_chunk(audio_bytes)
+
+                # Wait for LLM thread to finish cleanly
+                await llm_task
 
             except Exception as e:
                 logger.error(f"Pipeline error: {e}", exc_info=True)
 
             total_time = time.time() - pipeline_start
-            logger.info(f"Pipeline total: {total_time:.1f}s | Response: {full_response.strip()[:80]}...")
+            logger.info(f"Pipeline total: {total_time:.1f}s | Response: {full_response.strip()[:80]}")
 
             await send_json_safe({"type": "response", "text": full_response.strip()})
             state.tts_playing = False
+
+            # Drain any transcripts that queued during TTS
+            while not transcript_queue.empty():
+                try:
+                    transcript_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+
             if not state.barge_triggered:
                 await send_json_safe({"type": "status", "text": "🎤 Listening..."})
 
@@ -224,7 +262,13 @@ async def websocket_endpoint(ws: WebSocket):
             if "bytes" in data:
                 audio_bytes = data["bytes"]
 
-                vad_events = await asyncio.to_thread(vad.process, audio_bytes)
+                # Suppress VAD while TTS is playing to avoid
+                # the mic picking up speaker audio as "speech"
+                if not state.tts_playing:
+                    vad_events = await asyncio.to_thread(vad.process, audio_bytes)
+                else:
+                    vad_events = []
+
                 for evt in vad_events:
                     if evt["type"] == "speech_start":
                         asr.set_speech_active(True)

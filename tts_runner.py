@@ -106,7 +106,7 @@ class TTSRunner:
             if self.speed is not None:
                 kwargs["speed"] = self.speed
 
-            audios = self._model.generate(text=text, **kwargs)
+            audios = self._model.generate(text=text, num_step=16, **kwargs)
             if not audios:
                 logger.warning("OmniVoice produced no audio")
                 return b""
@@ -128,7 +128,24 @@ class TTSRunner:
             logger.error("OmniVoice error: %s", e, exc_info=True)
             return b""
 
+    # OmniVoice emotion tags that must be preserved in TTS text
+    _OMNIVOICE_TAGS = {
+        "[laughter]", "[sigh]", "[confirmation-en]", "[question-en]",
+        "[question-ah]", "[question-oh]", "[question-ei]", "[question-yi]",
+        "[surprise-ah]", "[surprise-oh]", "[surprise-wa]", "[surprise-yo]",
+        "[dissatisfaction-hnn]",
+    }
+
     def _clean_text(self, text: str) -> str:
+        # Temporarily replace OmniVoice tags with placeholders
+        # (using no underscores to avoid the underscore-stripping regex)
+        tag_map = {}
+        for i, tag in enumerate(self._OMNIVOICE_TAGS):
+            placeholder = f"OMOTAG{i}END"
+            if tag in text:
+                text = text.replace(tag, placeholder)
+                tag_map[placeholder] = tag
+
         emoji_pattern = re.compile(
             "["
             "\U0001F600-\U0001F64F\U0001F300-\U0001F5FF"
@@ -145,6 +162,19 @@ class TTSRunner:
         text = re.sub(r"#+\s*", "", text)
         text = re.sub(r"\([^)]*\)", "", text)
         text = re.sub(r"\s+", " ", text).strip()
+
+        # Restore OmniVoice tags
+        for placeholder, tag in tag_map.items():
+            text = text.replace(placeholder, tag)
+
+        # Strip any remaining [bracket-tags] that the LLM invented
+        # (not in the valid OmniVoice set)
+        def _strip_invalid_tags(match):
+            return match.group(0) if match.group(0) in self._OMNIVOICE_TAGS else ""
+
+        text = re.sub(r"\[[^\]]+\]", _strip_invalid_tags, text)
+        text = re.sub(r"\s+", " ", text).strip()
+
         return text
 
     def cleanup(self) -> None:

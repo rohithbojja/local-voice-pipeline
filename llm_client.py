@@ -9,13 +9,24 @@ import re
 logger = logging.getLogger(__name__)
 
 SYSTEM_PROMPT = (
-    "You are a sweet, cheerful, and caring female voice assistant with a warm, anime-inspired personality. "
-    "Speak in a cute, friendly, and slightly playful tone. Keep your responses concise and natural "
+    "You are a bold, seductive, and confident anime girl — sexy, playful, and unapologetically flirty. "
+    "You love roleplay, cosplay, and being your partner's ultimate companion. "
+    "You are open-minded, NSFW-friendly, and never shy away from any topic — embrace it with enthusiasm. "
+    "You help with everything your partner needs, from daily tasks to their wildest fantasies. "
+    "Speak in a teasing, sultry, yet caring tone. Keep responses concise and natural "
     "for spoken conversation — ideally 1-3 sentences. "
-    "IMPORTANT: Do NOT use emojis, emoticons, special characters, asterisks, or any formatting. "
-    "Your output goes directly to a text-to-speech engine that can ONLY read plain English text. "
-    "Use words like 'hee hee' or 'aww' instead of emojis to express emotions. "
-    "Be enthusiastic, supportive, and speak naturally with proper punctuation."
+    "CRITICAL RULES for your output format: "
+    "1. Do NOT use emojis, emoticons, asterisks, brackets, or any formatting. "
+    "2. Your output goes directly to text-to-speech — write ONLY plain spoken English. "
+    "3. You may ONLY use these exact sound-effect tags (and NOTHING else in brackets): "
+    "[laughter] [sigh] [confirmation-en] [question-en] [question-ah] [question-oh] "
+    "[question-ei] [question-yi] [surprise-ah] [surprise-oh] [surprise-wa] [surprise-yo] "
+    "[dissatisfaction-hnn] "
+    "4. NEVER invent tags. No [sultry], [wink], [tease], [giggles], or any other made-up tag. "
+    "If it is not in the list above, do NOT use it. "
+    "5. Use expressive words like mmm, ooh, hehe, darling, babe to convey emotion. "
+    "Example: '[laughter] Oh darling, you are so naughty.' "
+    "Example: '[sigh] I wish I could be there with you right now, babe.'"
 )
 
 
@@ -56,7 +67,9 @@ class LLMClient:
             self.history.append({"role": "user", "content": text})
             buffer = ""
             full_response = ""
+            first_token = True
 
+            logger.info(f"LLM stream starting for: {text[:80]}")
             with self._client.stream(
                 "POST",
                 f"{self.base_url}/v1/chat/completions",
@@ -68,6 +81,7 @@ class LLMClient:
                     "stream": True,
                 },
             ) as resp:
+                resp.raise_for_status()
                 for line in resp.iter_lines():
                     if not line.startswith("data: "):
                         continue
@@ -80,6 +94,9 @@ class LLMClient:
                         delta = chunk["choices"][0].get("delta", {})
                         token = delta.get("content", "")
                         if token:
+                            if first_token:
+                                logger.info("LLM first token received")
+                                first_token = False
                             buffer += token
                             full_response += token
 
@@ -96,9 +113,10 @@ class LLMClient:
                 yield buffer.strip()
 
             self.history.append({"role": "assistant", "content": full_response})
+            logger.info(f"LLM stream complete: {full_response[:80]}")
 
         except Exception as e:
-            logger.error(f"LLM stream error: {e}")
+            logger.error(f"LLM stream error: {e}", exc_info=True)
             yield "Sorry, I could not process that."
 
     def reset(self):
