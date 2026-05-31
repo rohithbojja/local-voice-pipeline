@@ -1,186 +1,222 @@
 """
-TTS — OmniVoice (k2-fsa/OmniVoice): always uses a fixed reference clip for zero-shot cloning.
-https://huggingface.co/k2-fsa/OmniVoice
+TTS — Supertonic (supertone-inc/supertonic): lightning-fast, on-device ONNX TTS.
+https://github.com/supertone-inc/supertonic
+Install: pip install 'supertonic[serve]'
+
+Expression tags (Supertonic 3):
+    <laugh> <breath> <sigh> <cough> <sneeze> <groan> <hmm> <uh> <um> <yawn>
+
+OmniVoice [bracket-style] tags emitted by the LLM are mapped → stripped/translated.
 """
 from __future__ import annotations
 
 import logging
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Optional
 
 import numpy as np
-import torch
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# OmniVoice → Supertonic expression-tag translation table.
+# Tags not listed here are stripped entirely.
+# ---------------------------------------------------------------------------
+_OMNIVOICE_TO_SUPERTONIC: dict[str, str] = {
+    "[laughter]":        "<laugh>",
+    "[sigh]":            "<sigh>",
+    "[breath]":          "<breath>",
+    "[cough]":           "<cough>",
+    "[sneeze]":          "<sneeze>",
+    "[groan]":           "<groan>",
+    "[hmm]":             "<hmm>",
+    "[uh]":              "<uh>",
+    "[um]":              "<um>",
+    "[yawn]":            "<yawn>",
+    # These OmniVoice tags have no direct Supertonic equivalent → strip
+    "[confirmation-en]": "",
+    "[question-en]":     "",
+    "[question-ah]":     "",
+    "[question-oh]":     "",
+    "[question-ei]":     "",
+    "[question-yi]":     "",
+    "[surprise-ah]":     "",
+    "[surprise-oh]":     "",
+    "[surprise-wa]":     "",
+    "[surprise-yo]":     "",
+    "[dissatisfaction-hnn]": "",
+}
 
-def _device_map_and_dtype(device_pref: str) -> tuple[str, torch.dtype]:
-    """Pick Hugging Face device_map and dtype from a coarse preference (cuda / mps / cpu)."""
-    p = (device_pref or "cuda").lower().strip()
-    if p.startswith("cuda"):
-        if torch.cuda.is_available():
-            return ("cuda:0" if p in ("cuda", "cuda:0") else p), torch.float16
-        logger.warning("CUDA requested but not available; using CPU.")
-    if p.startswith("mps"):
-        if torch.backends.mps.is_available():
-            return ("mps:0" if p == "mps" else p), torch.float16
-        logger.warning("MPS requested but not available; using CPU.")
-    return "cpu", torch.float32
+# Valid Supertonic expression tags (complete list from v3 docs)
+_SUPERTONIC_TAGS: frozenset[str] = frozenset({
+    "<laugh>", "<breath>", "<sigh>", "<cough>",
+    "<sneeze>", "<groan>", "<hmm>", "<uh>", "<um>", "<yawn>",
+})
+
+# Pre-compiled regex for OmniVoice [bracket] tags
+_OMNIVOICE_TAG_RE = re.compile(
+    r"\[(?:laughter|sigh|breath|cough|sneeze|groan|hmm|uh|um|yawn"
+    r"|confirmation-en|question-(?:en|ah|oh|ei|yi)"
+    r"|surprise-(?:ah|oh|wa|yo)"
+    r"|dissatisfaction-hnn)\]"
+)
+
+# Emoji / markdown cleanup
+_EMOJI_RE = re.compile(
+    "["
+    "\U0001F600-\U0001F64F\U0001F300-\U0001F5FF"
+    "\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF"
+    "\U00002702-\U000027B0\U000024C2-\U0001F251"
+    "\U00010000-\U0010ffff\u200d\ufe0f"
+    "\u2600-\u26FF\u2700-\u27BF"
+    "]+",
+    flags=re.UNICODE,
+)
 
 
 class TTSRunner:
-    """OmniVoice inference with a single cached voice-clone prompt (reference WAV + transcript)."""
+    """Supertonic inference — preset voices or Voice Builder JSON for voice cloning."""
 
     def __init__(
         self,
-        model_id: str,
-        ref_audio: str,
-        ref_text: str,
-        device_pref: str,
-        language: Optional[str],
-        speed: Optional[float],
-        generation_kwargs: Optional[dict[str, Any]] = None,
+        voice: str = "F1",
+        voice_json: Optional[str] = None,
+        lang: Optional[str] = "en",
+        speed: float = 1.05,
+        total_steps: int = 5,          # 5 = balanced speed/quality (docs: 2=fast,5=balanced,10=high)
+        silence_duration: float = 0.15, # shorter pauses between chunks for real-time feel
+        intra_op_threads: Optional[int] = None,
+        inter_op_threads: Optional[int] = None,
     ):
-        self.model_id = model_id
-        self.ref_audio = ref_audio
-        self.ref_text = ref_text
-        self.device_pref = device_pref
-        self.language = language
+        self.voice = voice
+        self.voice_json = voice_json
+        self.lang = lang
         self.speed = speed
-        self.generation_kwargs = generation_kwargs or {}
-        self._model = None
-        self._clone_prompt = None
-        self.sample_rate = 24000
+        self.total_steps = total_steps
+        self.silence_duration = silence_duration
+        self.intra_op_threads = intra_op_threads
+        self.inter_op_threads = inter_op_threads
 
+        # Supertonic outputs 44100 Hz
+        self.sample_rate = 44100
+        self._tts = None
+        self._style = None
+
+    # ------------------------------------------------------------------
     def _ensure_model(self) -> None:
-        if self._model is not None:
+        if self._tts is not None:
             return
 
-        from omnivoice import OmniVoice
+        from supertonic import TTS
 
-        device_map, torch_dtype = _device_map_and_dtype(self.device_pref)
-        logger.info("Loading OmniVoice %s on %s (%s)...", self.model_id, device_map, torch_dtype)
+        label = f"json={self.voice_json}" if self.voice_json else f"preset={self.voice}"
+        logger.info("Loading Supertonic (%s, lang=%s, steps=%d)…",
+                    label, self.lang, self.total_steps)
 
-        self._model = OmniVoice.from_pretrained(
-            self.model_id,
-            torch_dtype=torch_dtype,
-            device_map=device_map,
+        self._tts = TTS(
+            auto_download=True,
+            intra_op_num_threads=self.intra_op_threads,
+            inter_op_num_threads=self.inter_op_threads,
         )
-        sr = getattr(self._model, "sampling_rate", None)
+
+        if self.voice_json:
+            json_path = Path(self.voice_json).expanduser()
+            if not json_path.is_file():
+                raise FileNotFoundError(
+                    f"Voice Builder JSON not found: {json_path.resolve()}. "
+                    "Download from https://supertonic.supertone.ai/voice-builder "
+                    "and set SUPERTONIC_VOICE_JSON in .env"
+                )
+            self._style = self._tts.get_voice_style_from_path(json_path)
+            logger.info("Supertonic: loaded cloned voice from %s", json_path)
+        else:
+            self._style = self._tts.get_voice_style(voice_name=self.voice)
+            logger.info("Supertonic: using built-in preset '%s'", self.voice)
+
+        sr = getattr(self._tts, "sample_rate", None)
         if sr:
             self.sample_rate = int(sr)
+        logger.info("Supertonic ready (sample_rate=%s)", self.sample_rate)
 
-        path = Path(self.ref_audio).expanduser()
-        if not path.is_file():
-            raise FileNotFoundError(
-                f"Reference audio not found: {path.resolve()}. "
-                "Add reference.wav beside config.py or set OMNIVOICE_REF_AUDIO."
-            )
-        transcript = (self.ref_text or "").strip()
-        if not transcript:
-            raise ValueError(
-                "Reference transcript is empty. Set OMNIVOICE_REF_TEXT or add reference.txt "
-                "(exact words spoken in the reference WAV) beside config.py."
-            )
-        self._clone_prompt = self._model.create_voice_clone_prompt(
-            str(path.resolve()),
-            transcript,
-        )
-        logger.info("OmniVoice voice-clone prompt built from %s", path)
-
-        logger.info("OmniVoice loaded (sample_rate=%s)", self.sample_rate)
-
+    # ------------------------------------------------------------------
     def generate(self, text: str) -> bytes:
-        """PCM16 mono bytes at ``self.sample_rate``."""
+        """Return PCM-16 mono bytes at ``self.sample_rate``."""
         self._ensure_model()
         text = self._clean_text(text)
         if not text:
             return b""
 
         try:
-            kwargs = dict(self.generation_kwargs)
-            kwargs["voice_clone_prompt"] = self._clone_prompt
-            if self.language:
-                kwargs["language"] = self.language
-            if self.speed is not None:
-                kwargs["speed"] = self.speed
+            wav, duration = self._tts.synthesize(
+                text=text,
+                voice_style=self._style,
+                lang=self.lang,
+                total_steps=self.total_steps,
+                speed=self.speed,
+                silence_duration=self.silence_duration,
+            )
+            # wav: float32 ndarray (1, num_samples); duration: scalar or (1,) array
+            audio = wav.squeeze()
 
-            audios = self._model.generate(text=text, num_step=16, **kwargs)
-            if not audios:
-                logger.warning("OmniVoice produced no audio")
-                return b""
+            # Trim to actual duration
+            dur_val = float(duration) if not hasattr(duration, "__len__") else float(duration[0])
+            dur_samples = int(self.sample_rate * dur_val)
+            audio = audio[:dur_samples]
 
-            wav = np.concatenate([np.asarray(a, dtype=np.float32) for a in audios])
-            peak = float(np.max(np.abs(wav))) if wav.size else 0.0
+            # Peak-normalise to 0.95
+            peak = float(np.max(np.abs(audio))) if audio.size else 0.0
             if peak > 0:
-                wav = wav / peak * 0.95
+                audio = audio / peak * 0.95
 
-            pcm16 = (wav * 32767.0).astype(np.int16)
+            pcm16 = (audio * 32767.0).astype(np.int16)
             audio_bytes = pcm16.tobytes()
             logger.info(
-                "OmniVoice generated %d bytes (%.2fs)",
+                "Supertonic → %d bytes (%.2fs)",
                 len(audio_bytes),
                 len(pcm16) / self.sample_rate,
             )
             return audio_bytes
+
         except Exception as e:
-            logger.error("OmniVoice error: %s", e, exc_info=True)
+            logger.error("Supertonic error: %s", e, exc_info=True)
             return b""
 
-    # OmniVoice emotion tags that must be preserved in TTS text
-    _OMNIVOICE_TAGS = {
-        "[laughter]", "[sigh]", "[confirmation-en]", "[question-en]",
-        "[question-ah]", "[question-oh]", "[question-ei]", "[question-yi]",
-        "[surprise-ah]", "[surprise-oh]", "[surprise-wa]", "[surprise-yo]",
-        "[dissatisfaction-hnn]",
-    }
-
+    # ------------------------------------------------------------------
     def _clean_text(self, text: str) -> str:
-        # Temporarily replace OmniVoice tags with placeholders
-        # (using no underscores to avoid the underscore-stripping regex)
-        tag_map = {}
-        for i, tag in enumerate(self._OMNIVOICE_TAGS):
-            placeholder = f"OMOTAG{i}END"
-            if tag in text:
-                text = text.replace(tag, placeholder)
-                tag_map[placeholder] = tag
+        """
+        1. Translate OmniVoice [bracket] tags → Supertonic <angle> equivalents.
+        2. Strip emoji, markdown artifacts.
+        3. Strip any remaining <angle> tags not in the valid Supertonic set.
+        """
+        # 1. Translate / strip OmniVoice bracket tags
+        def _translate_omnivoice(m: re.Match) -> str:
+            return _OMNIVOICE_TO_SUPERTONIC.get(m.group(0), "")
 
-        emoji_pattern = re.compile(
-            "["
-            "\U0001F600-\U0001F64F\U0001F300-\U0001F5FF"
-            "\U0001F680-\U0001F6FF\U0001F1E0-\U0001F1FF"
-            "\U00002702-\U000027B0\U000024C2-\U0001F251"
-            "\U00010000-\U0010ffff\u200d\ufe0f"
-            "\u2600-\u26FF\u2700-\u27BF"
-            "]+",
-            flags=re.UNICODE,
-        )
-        text = emoji_pattern.sub("", text)
+        text = _OMNIVOICE_TAG_RE.sub(_translate_omnivoice, text)
+
+        # Also catch any stray [anything-else] bracket tags the LLM invented
+        text = re.sub(r"\[[^\]]+\]", "", text)
+
+        # 2. Emoji + markdown cleanup
+        text = _EMOJI_RE.sub("", text)
         text = re.sub(r"\*+", "", text)
         text = re.sub(r"_+", " ", text)
         text = re.sub(r"#+\s*", "", text)
         text = re.sub(r"\([^)]*\)", "", text)
         text = re.sub(r"\s+", " ", text).strip()
 
-        # Restore OmniVoice tags
-        for placeholder, tag in tag_map.items():
-            text = text.replace(placeholder, tag)
+        # 3. Strip <angle> tags not in the valid Supertonic set
+        def _strip_invalid_angle(m: re.Match) -> str:
+            return m.group(0) if m.group(0) in _SUPERTONIC_TAGS else ""
 
-        # Strip any remaining [bracket-tags] that the LLM invented
-        # (not in the valid OmniVoice set)
-        def _strip_invalid_tags(match):
-            return match.group(0) if match.group(0) in self._OMNIVOICE_TAGS else ""
-
-        text = re.sub(r"\[[^\]]+\]", _strip_invalid_tags, text)
+        text = re.sub(r"<[^>]+>", _strip_invalid_angle, text)
         text = re.sub(r"\s+", " ", text).strip()
-
         return text
 
+    # ------------------------------------------------------------------
     def cleanup(self) -> None:
-        self._clone_prompt = None
-        if self._model is not None:
-            del self._model
-            self._model = None
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        self._style = None
+        if self._tts is not None:
+            del self._tts
+            self._tts = None

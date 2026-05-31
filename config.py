@@ -16,17 +16,6 @@ except ImportError:
     pass
 
 
-def _resolve_omnivoice_reference() -> tuple[str, str]:
-    """Voice clone is always on: WAV path + transcript (env or ``reference.txt``)."""
-    audio = (os.environ.get("OMNIVOICE_REF_AUDIO") or str(_ROOT / "reference.wav")).strip()
-    text = os.environ.get("OMNIVOICE_REF_TEXT", "").strip()
-    if not text:
-        txt_path = _ROOT / "reference.txt"
-        if txt_path.is_file():
-            text = txt_path.read_text(encoding="utf-8").strip()
-    return audio, text
-
-
 # ----- ASR (Faster-Whisper — local) -----
 ASR_MODEL = os.environ.get("ASR_MODEL", "large-v3-turbo")
 ASR_DEVICE = os.environ.get("ASR_DEVICE", "cuda")
@@ -35,14 +24,25 @@ ASR_LANGUAGE = os.environ.get("ASR_LANGUAGE", "en")
 ASR_SAMPLE_RATE = int(os.environ.get("ASR_SAMPLE_RATE", "16000"))
 ASR_CPU_THREADS = int(os.environ.get("ASR_CPU_THREADS", "0"))
 
-# ----- TTS (OmniVoice — https://huggingface.co/k2-fsa/OmniVoice) -----
-OMNIVOICE_MODEL = os.environ.get("OMNIVOICE_MODEL", "k2-fsa/OmniVoice")
-OMNIVOICE_REF_AUDIO, OMNIVOICE_REF_TEXT = _resolve_omnivoice_reference()
-TTS_DEVICE = os.environ.get("TTS_DEVICE", "cuda")
-OMNIVOICE_LANGUAGE = os.environ.get("OMNIVOICE_LANGUAGE", "en").strip() or None
-_omni_speed = os.environ.get("OMNIVOICE_SPEED", "").strip()
-OMNIVOICE_SPEED: float | None = float(_omni_speed) if _omni_speed else None
-TTS_SAMPLE_RATE = 24000
+# ----- TTS (Supertonic — https://github.com/supertone-inc/supertonic) -----
+# pip install 'supertonic[serve]'
+SUPERTONIC_VOICE = os.environ.get("SUPERTONIC_VOICE", "F1")
+# Optional: path to a Voice Builder JSON for custom voice cloning.
+# Download from https://supertonic.supertone.ai/voice-builder
+# When set, overrides SUPERTONIC_VOICE.
+SUPERTONIC_VOICE_JSON: str | None = os.environ.get("SUPERTONIC_VOICE_JSON", "").strip() or None
+SUPERTONIC_LANG = os.environ.get("SUPERTONIC_LANG", "en")
+_st_speed = os.environ.get("SUPERTONIC_SPEED", "1.05").strip()
+SUPERTONIC_SPEED: float = float(_st_speed) if _st_speed else 1.05
+_st_steps = os.environ.get("SUPERTONIC_STEPS", "5").strip()   # 2=fastest 5=balanced 10=high
+SUPERTONIC_STEPS: int = int(_st_steps) if _st_steps else 5
+_st_silence = os.environ.get("SUPERTONIC_SILENCE_DURATION", "0.15").strip()
+SUPERTONIC_SILENCE_DURATION: float = float(_st_silence) if _st_silence else 0.15
+_st_intra = os.environ.get("SUPERTONIC_INTRA_OP_THREADS", "").strip()
+SUPERTONIC_INTRA_OP_THREADS: int | None = int(_st_intra) if _st_intra else None
+_st_inter = os.environ.get("SUPERTONIC_INTER_OP_THREADS", "").strip()
+SUPERTONIC_INTER_OP_THREADS: int | None = int(_st_inter) if _st_inter else None
+TTS_SAMPLE_RATE = 44100  # Supertonic outputs 44.1 kHz
 
 # ----- LLM (Local — Ollama) -----
 LLM_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:11434")

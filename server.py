@@ -1,14 +1,13 @@
 """
 Local Voice Pipeline — Ultra-Fast WebSocket Server
 
-Browser → WebSocket → VAD → Whisper ASR → LLM (stream) → OmniVoice TTS → Audio back
+Browser → WebSocket → VAD → Whisper ASR → LLM (stream) → Supertonic TTS → Audio back
 
 All models pre-loaded at startup. LLM streams sentence-by-sentence,
 TTS generates per-sentence for minimal latency.
 
 Run:  python server.py
-Open: http://localhost:8890
-"""
+Open: http://localhost:8890"""
 import asyncio
 import logging
 import base64
@@ -68,18 +67,21 @@ def preload_all_models():
     _asr_model = WhisperModel(config.ASR_MODEL, **_asr_kw)
     print(f"  ✅ Whisper ({config.ASR_MODEL}) loaded")
 
-    # 2. OmniVoice TTS
-    print("  [2/3] Loading OmniVoice TTS...")
+    # 2. Supertonic TTS
+    print("  [2/3] Loading Supertonic TTS...")
     _tts_runner = TTSRunner(
-        model_id=config.OMNIVOICE_MODEL,
-        ref_audio=config.OMNIVOICE_REF_AUDIO,
-        ref_text=config.OMNIVOICE_REF_TEXT,
-        device_pref=config.TTS_DEVICE,
-        language=config.OMNIVOICE_LANGUAGE,
-        speed=config.OMNIVOICE_SPEED,
+        voice=config.SUPERTONIC_VOICE,
+        voice_json=config.SUPERTONIC_VOICE_JSON,
+        lang=config.SUPERTONIC_LANG,
+        speed=config.SUPERTONIC_SPEED,
+        total_steps=config.SUPERTONIC_STEPS,
+        silence_duration=config.SUPERTONIC_SILENCE_DURATION,
+        intra_op_threads=config.SUPERTONIC_INTRA_OP_THREADS,
+        inter_op_threads=config.SUPERTONIC_INTER_OP_THREADS,
     )
     _tts_runner._ensure_model()
-    print(f"  ✅ OmniVoice ({config.OMNIVOICE_MODEL}) + clone ref loaded")
+    voice_label = config.SUPERTONIC_VOICE_JSON or f"preset={config.SUPERTONIC_VOICE}"
+    print(f"  ✅ Supertonic ({voice_label}, lang={config.SUPERTONIC_LANG}, steps={config.SUPERTONIC_STEPS}) loaded")
 
     # 3. Silero VAD
     print("  [3/3] Loading Silero VAD...")
@@ -312,7 +314,7 @@ if __name__ == "__main__":
     print("  🎙️  Ultra-Fast Local Voice Pipeline")
     print(f"  ASR: Whisper ({config.ASR_MODEL})")
     print(f"  LLM: {config.LLM_MODEL} (streaming)")
-    print(f"  TTS: OmniVoice ({config.OMNIVOICE_MODEL})")
+    print(f"  TTS: Supertonic (voice={config.SUPERTONIC_VOICE}, lang={config.SUPERTONIC_LANG})")
     print(f"  Open: http://localhost:{config.SERVER_PORT}")
     print("=" * 60)
     uvicorn.run(app, host=config.SERVER_HOST, port=config.SERVER_PORT, log_level="info")

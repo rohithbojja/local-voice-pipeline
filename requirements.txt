@@ -3,8 +3,8 @@ python-dotenv
 # ASR (Faster-Whisper — local)
 faster-whisper
 
-# TTS — OmniVoice (https://huggingface.co/k2-fsa/OmniVoice)
-omnivoice
+# TTS — Supertonic (https://github.com/supertone-inc/supertonic)
+supertonic[serve]
 
 # LLM (local OpenAI-compatible API — Ollama)
 httpx
